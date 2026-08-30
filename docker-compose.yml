@@ -1,0 +1,12 @@
+services:
+  daily-bot:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      # credenciales y estado local (dedup entre reinicios)
+      - ./credentials.json:/app/credentials.json:ro
+      - ./miembros.json:/app/miembros.json:ro
+      - ./data:/app/data
+    environment:
+      ESTADO_FILE: /app/data/procesados.json
