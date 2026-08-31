@@ -1,8 +1,25 @@
-/ssh-key-2026-08-30.key
-/ssh-key-2026-08-30.key.pub
+# ---- Secretos: NUNCA subir ----
 .env
 credentials.json
-miembros.json
-procesados.json
+*.key
+*.pem
+ssh-key-*
+
+# ---- Datos locales del bot ----
+miembros.json          # tiene IDs de Discord del equipo
+procesados.json        # estado de dedup
 data/
+
+# ---- Python ----
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ---- Entorno ----
+.vscode/
+.idea/
+.DS_Store
+*.log

@@ -41,9 +41,16 @@ HOJA = os.getenv("HOJA", "Dailies")
 CREDS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 TZ = ZoneInfo(os.getenv("TZ", "America/Argentina/Cordoba"))
 
-# Guarda el ID del mensaje en una 7ma columna (podés ocultarla en Sheets).
-# Sirve para deduplicar y para actualizar la fila si alguien edita el mensaje.
-GUARDAR_MSG_ID = os.getenv("GUARDAR_MSG_ID", "true").lower() == "true"
+# Regla: un registro por integrante por día. Si ya existe una fila con la misma
+# fecha y el mismo integrante, se actualiza en lugar de agregar otra.
+FILA_ENCABEZADOS = int(os.getenv("FILA_ENCABEZADOS", "1"))
+# Columna donde arranca la tabla (la de "Fecha"). Las 6 columnas se escriben a
+# partir de ahí: Fecha, Integrante, Ayer, Hoy, Impedimento, Estado.
+COLUMNA_INICIAL = os.getenv("COLUMNA_INICIAL", "A").strip().upper()
+# Formato con el que se escribe la fecha. ISO (%Y-%m-%d) es el más seguro: Sheets
+# lo interpreta como fecha real sin importar la configuración regional, y la
+# columna la muestra igual con su propio formato.
+FORMATO_FECHA = os.getenv("FORMATO_FECHA", "%Y-%m-%d")
 
 BASE_DIR = Path(__file__).parent
 ESTADO_FILE = Path(os.getenv("ESTADO_FILE", BASE_DIR / "procesados.json"))
@@ -161,19 +168,78 @@ def hoja():
     return _hoja
 
 
-def _fila_de_mensaje(msg_id: str):
-    """Busca la fila que ya tiene ese message id (columna 7). None si no está."""
-    if not GUARDAR_MSG_ID:
+def _letra_a_num(letra: str) -> int:
+    n = 0
+    for c in letra:
+        n = n * 26 + (ord(c) - 64)
+    return n
+
+
+def _num_a_letra(n: int) -> str:
+    letra = ""
+    while n > 0:
+        n, resto = divmod(n - 1, 26)
+        letra = chr(65 + resto) + letra
+    return letra
+
+
+COL_INI = _letra_a_num(COLUMNA_INICIAL)
+COL_FECHA = COLUMNA_INICIAL
+COL_INTEGRANTE = _num_a_letra(COL_INI + 1)
+COL_FIN = _num_a_letra(COL_INI + 5)
+
+
+def _misma_fecha(a: str, b: str) -> bool:
+    """Compara fechas tolerando distintos formatos de la planilla."""
+    a, b = a.strip(), b.strip()
+    if a and a == b:
+        return True
+
+    def parsear(texto):
+        for formato in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(texto, formato).date()
+            except ValueError:
+                continue
         return None
-    celda = hoja().find(str(msg_id), in_column=7)
-    return celda.row if celda else None
+
+    pa, pb = parsear(a), parsear(b)
+    return pa is not None and pa == pb
 
 
-def _escribir(fila: list, fila_existente: int | None):
-    if fila_existente:
-        hoja().update([fila], f"A{fila_existente}", value_input_option="USER_ENTERED")
-    else:
-        hoja().append_row(fila, value_input_option="USER_ENTERED")
+def _upsert(fila: list) -> str:
+    """Actualiza la fila del día si ya existe; si no, agrega al final.
+
+    Devuelve "Actualizada" o "Cargada", solo para el log.
+    """
+    fecha, integrante = fila[0], fila[1].strip().lower()
+
+    # Una sola lectura de Fecha e Integrante. get_values() no devuelve las filas
+    # vacías del final, así que len() es la última fila realmente usada: eso evita
+    # que la carga caiga al fondo de la hoja.
+    valores = hoja().get_values(f"{COL_FECHA}:{COL_INTEGRANTE}")
+
+    destino = None
+    for nro, renglon in enumerate(valores, start=1):
+        if nro <= FILA_ENCABEZADOS:
+            continue
+        f = renglon[0] if renglon else ""
+        n = renglon[1] if len(renglon) > 1 else ""
+        if _misma_fecha(f, fecha) and n.strip().lower() == integrante:
+            destino = nro
+            break
+
+    accion = "Actualizada"
+    if destino is None:
+        destino = max(len(valores), FILA_ENCABEZADOS) + 1
+        accion = "Cargada"
+
+    hoja().update(
+        [fila],
+        f"{COL_FECHA}{destino}:{COL_FIN}{destino}",
+        value_input_option="USER_ENTERED",
+    )
+    return accion
 
 
 # --------------------------------------------------------------------------- #
@@ -225,7 +291,7 @@ async def registrar(mensaje: discord.Message, forzar: bool = False) -> bool:
     if not daily:
         return False
 
-    fecha = mensaje.created_at.astimezone(TZ).strftime("%d/%m/%Y")
+    fecha = mensaje.created_at.astimezone(TZ).strftime(FORMATO_FECHA)
     fila = [
         fecha,
         nombre_de(mensaje.author),
@@ -234,16 +300,12 @@ async def registrar(mensaje: discord.Message, forzar: bool = False) -> bool:
         daily["impedimento"],
         estado_bloqueo(daily["impedimento"]),
     ]
-    if GUARDAR_MSG_ID:
-        fila.append(str(mensaje.id))
-
     async with sheets_lock:
-        existente = await asyncio.to_thread(_fila_de_mensaje, mensaje.id)
-        await asyncio.to_thread(_escribir, fila, existente)
+        accion = await asyncio.to_thread(_upsert, fila)
 
     procesados.add(str(mensaje.id))
     guardar_procesados(procesados)
-    log.info("Cargada daily de %s (%s)", fila[1], fecha)
+    log.info("%s daily de %s (%s)", accion, fila[1], fecha)
     return True
 
 
@@ -285,7 +347,7 @@ async def on_message(mensaje: discord.Message):
 
 @client.event
 async def on_message_edit(_antes: discord.Message, despues: discord.Message):
-    """Si alguien corrige su daily, actualiza la fila en lugar de duplicarla."""
+    """Si alguien corrige su daily, se reescribe la fila de ese día."""
     try:
         await registrar(despues, forzar=True)
     except Exception:
